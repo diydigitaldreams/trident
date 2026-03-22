@@ -33,7 +33,7 @@ Scope enforcement is powered by [PerimeterGuard](https://github.com/diydigitaldr
 
 ## Author
 
-Jean Paul Serrano Melendez — [DIY Digital Dreams](https://yourdigitaldreams.com)
+Jean Paul Serrano Melendez — DIY Digital Dreams.
 
 ## License
 
