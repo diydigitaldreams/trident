@@ -17,6 +17,13 @@ const digest = async (t) => {
   return Array.from(new Uint8Array(b)).map(x => x.toString(16).padStart(2,"0")).join("");
 };
 const now = () => new Date().toISOString();
+const MODEL_ID = "claude-sonnet-4-20250514";
+const isValidCIDR = (s) => { const m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/); return m && [1,2,3,4].every(i => +m[i] >= 0 && +m[i] <= 255) && +m[5] >= 0 && +m[5] <= 32; };
+const isValidHost = (s) => /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/.test(s) || /^\d{1,3}(\.\d{1,3}){3}$/.test(s);
+const isValidDomain = (s) => /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/.test(s);
+const isValidApiKey = (k) => typeof k === "string" && (k.startsWith("sk-ant-") || k.startsWith("sk-"));
+const isValidCWE = (s) => !s || /^CWE-\d+$/i.test(s);
+const sanitizeForPrompt = (s, max = 500) => String(s).slice(0, max).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
 const hms = (i) => { try { return new Date(i).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"}); } catch{return"—";}};
 const hmFull = (i) => { try { return new Date(i).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}); } catch{return"—";}};
 
@@ -84,9 +91,16 @@ const SC = {critical:"#ef4444",high:"#f97316",medium:"#f59e0b",low:"#22c55e",inf
 const RC = {critical:"#ef4444",high:"#f97316",medium:"#f59e0b",low:"#22c55e"};
 const TC = {action:"#22c55e",plan:"#3b82f6",approval:"#f59e0b",violation:"#ef4444",finding:"#f97316",import:"#8b5cf6",export:"#06b6d4",knowledge:"#a78bfa"};
 
+const storage = {
+  get: async (k) => { try { return await window.storage?.get(k); } catch { try { const v = localStorage.getItem(k); return v ? { value: v } : null; } catch { return null; } } },
+  set: async (k, v) => { try { await window.storage?.set(k, v); } catch { try { localStorage.setItem(k, v); } catch {} } },
+  delete: async (k) => { try { await window.storage?.delete(k); } catch { try { localStorage.removeItem(k); } catch {} } }
+};
+
 // ─── PERIMETERGUARD (inline — canonical: github.com/diydigitaldreams/perimeterguard) ──
 function escapeRegex(s){return s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");}
 function normalizeTarget(t){return t.replace(/^https?:\/\//,"").split("/")[0].split(":")[0];}
+// NOTE: IPv4 only. IPv6 CIDR support is out of scope for single-file artifact.
 function matchCIDR(host,cidr){
   const parts=cidr.split("/");if(parts.length!==2)return host===cidr;
   const mask=parseInt(parts[1],10);if(isNaN(mask)||mask<0||mask>32)return false;
@@ -98,7 +112,7 @@ function matchCIDR(host,cidr){
   const mi=mask===0?0:((~0<<(32-mask))>>>0);
   return(ci&mi)===(hi&mi);
 }
-function matchHost(h,p){if(!p.includes("*"))return h===p;return new RegExp("^"+p.split("*").map(escapeRegex).join(".*")+"$").test(h);}
+function matchHost(h,p){if(!p.includes("*"))return h===p;return new RegExp("^"+p.split("*").map(escapeRegex).join("[^.]*")+"$").test(h);}
 function matchDomain(h,d){if(d.startsWith("*."))return h.endsWith("."+d.slice(2))||h===d.slice(2);return h===d;}
 class PerimeterGuard{
   constructor(op){this.op=op;}
@@ -131,13 +145,15 @@ class PerimeterGuard{
 
 // ─── CLAUDE API ───────────────────────────────────────────────────────
 async function callClaude(apiKey,system,userMsg,maxTokens=1000){
-  const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:maxTokens,system,messages:[{role:"user",content:userMsg}]})});
+  if(!isValidApiKey(apiKey))throw new Error("Invalid API key format — expected sk-ant-* or sk-*");
+  const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:MODEL_ID,max_tokens:maxTokens,system,messages:[{role:"user",content:userMsg}]})});
+  if(!r.ok){const err=await r.json().catch(()=>({}));throw new Error(err.error?.message||`API error: ${r.status}`);}
   const d=await r.json();
   return d.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"";
 }
 async function callClaudeJSON(apiKey,system,userMsg){
-  const raw=await callClaude(apiKey,system+" Respond only with valid JSON. No markdown, no backticks.",userMsg);
-  try{return JSON.parse(raw.replace(/```json|```/g,"").trim());}catch{return null;}
+  try{const raw=await callClaude(apiKey,system+" Respond only with valid JSON. No markdown, no backticks.",userMsg);
+  try{return JSON.parse(raw.replace(/```json|```/g,"").trim());}catch{return null;}}catch(e){console.error("callClaudeJSON:",e.message);return null;}
 }
 
 // ─── DESIGN SYSTEM ────────────────────────────────────────────────────
@@ -170,28 +186,27 @@ function VDash({op,approvals,findings,violations,actions,evidence,timeline}){
 
 function VScope({op,setOp}){
   const[tab,sTab]=useState("perimeter");
-  const add=(path,val)=>{if(!val?.trim())return;const x=JSON.parse(JSON.stringify(op));const keys=path.split(".");let o=x;for(let i=0;i<keys.length-1;i++)o=o[keys[i]];if(!o[keys.at(-1)].includes(val.trim()))o[keys.at(-1)].push(val.trim());setOp(x);};
-  const rm=(path,idx)=>{const x=JSON.parse(JSON.stringify(op));const keys=path.split(".");let o=x;for(let i=0;i<keys.length-1;i++)o=o[keys[i]];o[keys.at(-1)].splice(idx,1);setOp(x);};
-  const setField=(path,val)=>{const x=JSON.parse(JSON.stringify(op));const keys=path.split(".");let o=x;for(let i=0;i<keys.length-1;i++)o=o[keys[i]];o[keys.at(-1)]=val;setOp(x);};
-  const[inp,sInp]=useState("");
+  const add=(path,val)=>{if(!val?.trim())return;const v=val.trim();if(path.endsWith(".cidrs")&&!isValidCIDR(v))return;if(path.endsWith(".hosts")&&!isValidHost(v))return;if(path.endsWith(".domains")&&!isValidDomain(v))return;const x=structuredClone(op);const keys=path.split(".");let o=x;for(let i=0;i<keys.length-1;i++)o=o[keys[i]];if(!o[keys.at(-1)].includes(v))o[keys.at(-1)].push(v);setOp(x);};
+  const rm=(path,idx)=>{const x=structuredClone(op);const keys=path.split(".");let o=x;for(let i=0;i<keys.length-1;i++)o=o[keys[i]];o[keys.at(-1)].splice(idx,1);setOp(x);};
+  const setField=(path,val)=>{const x=structuredClone(op);const keys=path.split(".");let o=x;for(let i=0;i<keys.length-1;i++)o=o[keys[i]];o[keys.at(-1)]=val;setOp(x);};
   return<div>
     <div style={{display:"flex",gap:4,marginBottom:16}}>{["perimeter","no-touch","constraints","meta"].map(t=><button key={t} onClick={()=>sTab(t)} style={{padding:"6px 14px",borderRadius:4,background:tab===t?"var(--a)":"transparent",color:tab===t?"#000":"var(--d)",border:`1px solid ${tab===t?"var(--a)":"var(--b)"}`,fontFamily:F,fontSize:9,fontWeight:700,cursor:"pointer",letterSpacing:1,textTransform:"uppercase"}}>{t}</button>)}</div>
     {tab==="perimeter"&&<Card>
       {[["PERIMETER HOSTS","perimeter.hosts","api.example.com"],["PERIMETER CIDRS","perimeter.cidrs","10.0.0.0/16"],["PERIMETER DOMAINS","perimeter.domains","*.corp.local"]].map(([title,path,ph])=><Sec key={path} t={title}>
         <div style={{display:"flex",gap:6,marginBottom:8}}><input placeholder={ph} onKeyDown={e=>{if(e.key==="Enter"){add(path,e.target.value);e.target.value="";}}}/><Btn sm onClick={()=>{}}>ADD</Btn></div>
-        {(path.split(".").reduce((o,k)=>o?.[k],op)||[]).map((h,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 0",borderBottom:"1px solid var(--bs)"}}><span style={{fontSize:11,fontFamily:F,color:"var(--a)"}}>{h}</span><Btn sm ol c="var(--r)" onClick={()=>rm(path,i)}>×</Btn></div>)}
+        {(path.split(".").reduce((o,k)=>o?.[k],op)||[]).map((h,i)=><div key={h} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 0",borderBottom:"1px solid var(--bs)"}}><span style={{fontSize:11,fontFamily:F,color:"var(--a)"}}>{h}</span><Btn sm ol c="var(--r)" onClick={()=>rm(path,i)}>×</Btn></div>)}
       </Sec>)}
     </Card>}
     {tab==="no-touch"&&<Card>
       {[["NO-TOUCH HOSTS","no_touch.hosts","prod.example.com"],["NO-TOUCH CIDRS","no_touch.cidrs","10.0.1.0/24"]].map(([title,path,ph])=><Sec key={path} t={title}>
         <div style={{display:"flex",gap:6,marginBottom:8}}><input placeholder={ph} onKeyDown={e=>{if(e.key==="Enter"){add(path,e.target.value);e.target.value="";}}}/><Btn sm onClick={()=>{}}>ADD</Btn></div>
-        {(path.split(".").reduce((o,k)=>o?.[k],op)||[]).map((h,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 0",borderBottom:"1px solid var(--bs)"}}><span style={{fontSize:11,fontFamily:F,color:"var(--r)"}}>{h}</span><Btn sm ol c="var(--r)" onClick={()=>rm(path,i)}>×</Btn></div>)}
+        {(path.split(".").reduce((o,k)=>o?.[k],op)||[]).map((h,i)=><div key={h} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 0",borderBottom:"1px solid var(--bs)"}}><span style={{fontSize:11,fontFamily:F,color:"var(--r)"}}>{h}</span><Btn sm ol c="var(--r)" onClick={()=>rm(path,i)}>×</Btn></div>)}
       </Sec>)}
     </Card>}
     {tab==="constraints"&&<Card>
-      <Sec t="BLOCKED TACTICS (always denied)">{TACTICS.map(t=>{const blocked=op.constraints.blocked_tactics.includes(t.short);return<button key={t.short} onClick={()=>{const x=JSON.parse(JSON.stringify(op));if(blocked)x.constraints.blocked_tactics=x.constraints.blocked_tactics.filter(s=>s!==t.short);else x.constraints.blocked_tactics.push(t.short);setOp(x);}} style={{margin:"0 4px 4px 0",padding:"4px 10px",borderRadius:3,background:blocked?"var(--r)":"transparent",color:blocked?"#fff":"var(--d)",border:`1px solid ${blocked?"var(--r)":"var(--b)"}`,fontFamily:F,fontSize:9,cursor:"pointer"}}>{t.name} <span style={{opacity:0.6}}>{t.id}</span></button>;})}
+      <Sec t="BLOCKED TACTICS (always denied)">{TACTICS.map(t=>{const blocked=op.constraints.blocked_tactics.includes(t.short);return<button key={t.short} onClick={()=>{const x=structuredClone(op);if(blocked)x.constraints.blocked_tactics=x.constraints.blocked_tactics.filter(s=>s!==t.short);else x.constraints.blocked_tactics.push(t.short);setOp(x);}} style={{margin:"0 4px 4px 0",padding:"4px 10px",borderRadius:3,background:blocked?"var(--r)":"transparent",color:blocked?"#fff":"var(--d)",border:`1px solid ${blocked?"var(--r)":"var(--b)"}`,fontFamily:F,fontSize:9,cursor:"pointer"}}>{t.name} <span style={{opacity:0.6}}>{t.id}</span></button>;})}
       </Sec>
-      <Sec t="GATED TACTICS (approval required in supervised)">{TACTICS.map(t=>{const gated=op.constraints.gated_tactics.includes(t.short);return<button key={t.short} onClick={()=>{const x=JSON.parse(JSON.stringify(op));if(gated)x.constraints.gated_tactics=x.constraints.gated_tactics.filter(s=>s!==t.short);else x.constraints.gated_tactics.push(t.short);setOp(x);}} style={{margin:"0 4px 4px 0",padding:"4px 10px",borderRadius:3,background:gated?"var(--w)":"transparent",color:gated?"#000":"var(--d)",border:`1px solid ${gated?"var(--w)":"var(--b)"}`,fontFamily:F,fontSize:9,cursor:"pointer"}}>{t.name} <span style={{opacity:0.6}}>{t.id}</span></button>;})}
+      <Sec t="GATED TACTICS (approval required in supervised)">{TACTICS.map(t=>{const gated=op.constraints.gated_tactics.includes(t.short);return<button key={t.short} onClick={()=>{const x=structuredClone(op);if(gated)x.constraints.gated_tactics=x.constraints.gated_tactics.filter(s=>s!==t.short);else x.constraints.gated_tactics.push(t.short);setOp(x);}} style={{margin:"0 4px 4px 0",padding:"4px 10px",borderRadius:3,background:gated?"var(--w)":"transparent",color:gated?"#000":"var(--d)",border:`1px solid ${gated?"var(--w)":"var(--b)"}`,fontFamily:F,fontSize:9,cursor:"pointer"}}>{t.name} <span style={{opacity:0.6}}>{t.id}</span></button>;})}
       </Sec>
     </Card>}
     {tab==="meta"&&<Card><Sec t="OPERATION METADATA">
@@ -222,10 +237,10 @@ function VMap({op,actions,violations}){
   </Card>;
 }
 
-function VWorkbench({op,mode,setActions,setViolations,setEvidence,addTL,actions,evidence}){
+function VWorkbench({op,mode,setActions,setViolations,setEvidence,addTL,actions,evidence,apiKey,sApiKey,setApprovals}){
   const[target,sTarget]=useState("");const[tactic,sTactic]=useState("recon");const[tool,sTool]=useState("rustscan");
   const[output,sOutput]=useState("");const[phaseName,sPhaseName]=useState("");const[chat,sChat]=useState([]);
-  const[inp,sInp]=useState("");const[busy,sBusy]=useState(false);const[apiKey,sApiKey]=useState("");const[plan,sPlan]=useState(null);
+  const[inp,sInp]=useState("");const[busy,sBusy]=useState(false);const[plan,sPlan]=useState(null);
   const ref=useRef(null);useEffect(()=>{ref.current?.scrollIntoView({behavior:"smooth"});},[chat]);
   const guard=new PerimeterGuard(op);
   const execPhase=async()=>{
@@ -234,7 +249,7 @@ function VWorkbench({op,mode,setActions,setViolations,setEvidence,addTL,actions,
     const auth=guard.authorize(target),cls=guard.classify(tactic),gate=guard.gateCheck(tactic,mode);
     if(!auth.cleared){setViolations(p=>[...p,{id:uid(),ts:now(),target,reason:auth.reason}]);addTL("violation",`Violation: ${auth.reason}`);return;}
     if(!cls.allowed){setViolations(p=>[...p,{id:uid(),ts:now(),target,reason:cls.reason}]);addTL("violation",`Tactic blocked: ${cls.reason}`);return;}
-    if(gate==="gate"){addTL("approval",`Gate required: ${phaseName}`);return;}
+    if(gate==="gate"){setApprovals(p=>[...p,{id:uid(),status:"pending",phase:phaseName,target,tactic,ts:now()}]);addTL("approval",`Gate required: ${phaseName}`);return;}
     const seq=evidence.length+1,prevHash=evidence.length>0?evidence[evidence.length-1].hash:"GENESIS";
     const record={id:uid(),seq,ts:now(),operator:"practitioner",phase:phaseName,target,tactic,tool,output,perimeterCheck:auth,prevHash};
     const hash=await digest(JSON.stringify(record));
@@ -245,12 +260,12 @@ function VWorkbench({op,mode,setActions,setViolations,setEvidence,addTL,actions,
   };
   const genPlan=async()=>{
     if(!apiKey)return;sBusy(true);
-    const result=await callClaudeJSON(apiKey,"You are an assessment methodology advisor. Generate a phased assessment plan as JSON array: [{name,tactic,tool,description,risk_level}]. risk_level: low|medium|high. tactic: MITRE short names. Documentation and methodology only — no offensive techniques.",`Perimeter: ${JSON.stringify(op.perimeter)}\nConstraints: ${JSON.stringify(op.constraints)}`);
-    if(result)sPlan(Array.isArray(result)?result:[]);sBusy(false);
+    const result=await callClaudeJSON(apiKey,"You are an assessment methodology advisor. Generate a phased assessment plan as JSON array: [{name,tactic,tool,description,risk_level}]. risk_level: low|medium|high. tactic: MITRE short names. Documentation and methodology only — no offensive techniques.",`Perimeter: ${sanitizeForPrompt(JSON.stringify(op.perimeter),1000)}\nConstraints: ${sanitizeForPrompt(JSON.stringify(op.constraints),500)}`);
+    if(result){sPlan(Array.isArray(result)?result:[]);}sBusy(false);
   };
   const send=async()=>{
     if(!inp.trim()||!apiKey)return;const msg=inp.trim();sInp("");sChat(p=>[...p,{r:"user",t:msg}]);sBusy(true);
-    const text=await callClaude(apiKey,"You are TRIDENT's assessment advisor — a documentation specialist. Help with MITRE ATT&CK mappings, risk analysis, finding documentation, and methodology. Never provide attack code or offensive techniques.",`Operation: ${op.operation.name||"unnamed"}\n\n${msg}`);
+    const text=await callClaude(apiKey,"You are TRIDENT's assessment advisor — a documentation specialist. Help with MITRE ATT&CK mappings, risk analysis, finding documentation, and methodology. Never provide attack code or offensive techniques.",`Operation: ${sanitizeForPrompt(op.operation.name||"unnamed")}\n\n${sanitizeForPrompt(msg,1000)}`);
     sChat(p=>[...p,{r:"ai",t:text}]);sBusy(false);
   };
   return<div style={{display:"flex",flexDirection:"column",gap:12}}>
@@ -294,11 +309,11 @@ function VGate({approvals,setApprovals,addTL}){
   </div>;
 }
 
-function VFind({findings,setFindings,op,addTL}){
-  const[apiKey,sApiKey]=useState("");const[busy,sBusy]=useState(false);
+function VFind({findings,setFindings,op,addTL,apiKey,sApiKey}){
+  const[busy,sBusy]=useState(false);
   const[form,sForm]=useState({title:"",severity:"high",host:"",cwe:"",description:"",remediation:""});
-  const add=()=>{if(!form.title.trim())return;setFindings(p=>[...p,{...form,id:uid(),ts:now(),status:"open"}]);addTL("finding",`Finding: ${form.title}`);sForm({title:"",severity:"high",host:"",cwe:"",description:"",remediation:""});};
-  const aiDoc=async(f)=>{if(!apiKey)return;sBusy(true);const result=await callClaudeJSON(apiKey,"Security documentation specialist. Document this vulnerability as JSON: {description,technical_details,business_impact,remediation,references,mitre_tactic,mitre_id,cvss_vector}. Professional, accurate, no exploit code.",`Title: ${f.title}\nHost: ${f.host}\nSeverity: ${f.severity}`);if(result)setFindings(p=>p.map(x=>x.id===f.id?{...x,...result}:x));sBusy(false);};
+  const add=()=>{if(!form.title.trim())return;if(form.cwe&&!isValidCWE(form.cwe))return;setFindings(p=>[...p,{...form,id:uid(),ts:now(),status:"open"}]);addTL("finding",`Finding: ${form.title}`);sForm({title:"",severity:"high",host:"",cwe:"",description:"",remediation:""});};
+  const aiDoc=async(f)=>{if(!apiKey)return;sBusy(true);const result=await callClaudeJSON(apiKey,"Security documentation specialist. Document this vulnerability as JSON: {description,technical_details,business_impact,remediation,references,mitre_tactic,mitre_id,cvss_vector}. Professional, accurate, no exploit code.",`Title: ${sanitizeForPrompt(f.title)}\nHost: ${sanitizeForPrompt(f.host)}\nSeverity: ${sanitizeForPrompt(f.severity)}`);if(result)setFindings(p=>p.map(x=>x.id===f.id?{...x,...result}:x));sBusy(false);};
   const del=(id)=>setFindings(p=>p.filter(f=>f.id!==id));
   return<div>
     <Card><Sec t="ADD FINDING"/>
@@ -322,7 +337,11 @@ function VEvid({evidence}){
   const verify=async()=>{
     if(evidence.length===0){sVer({ok:true,msg:"No records to verify"});return;}
     const sorted=[...evidence].sort((a,b)=>a.seq-b.seq);
-    for(let i=1;i<sorted.length;i++){if(sorted[i].prevHash!==sorted[i-1].hash){sVer({ok:false,msg:`Chain broken at record #${sorted[i].seq}`});return;}}
+    for(let i=0;i<sorted.length;i++){
+      const recomputed=await digest(sorted[i].integrityPayload);
+      if(recomputed!==sorted[i].hash){sVer({ok:false,msg:`Hash mismatch at record #${sorted[i].seq}`});return;}
+      if(i>0&&sorted[i].prevHash!==sorted[i-1].hash){sVer({ok:false,msg:`Chain broken at record #${sorted[i].seq}`});return;}
+    }
     sVer({ok:true,msg:`Chain verified — ${evidence.length} records intact`});
   };
   return<div><Card><Sec t="MERKLE EVIDENCE CHAIN" action={<Btn sm onClick={verify}>VERIFY CHAIN</Btn>}/>
@@ -337,7 +356,7 @@ function VEvid({evidence}){
 
 function VTools({tools,setTools}){
   const[form,sForm]=useState({name:"",slot:"",desc:"",footprint:"low",tactics:""});
-  const addCustom=()=>{if(!form.name.trim())return;setTools(p=>[...p,{...form,tactics:form.tactics.split(",").map(t=>t.trim()).filter(Boolean),ver:"custom",on:true,core:false}]);sForm({name:"",slot:"",desc:"",footprint:"low",tactics:""});};
+  const addCustom=()=>{if(!form.name.trim())return;const tacticList=form.tactics.split(",").map(t=>t.trim()).filter(Boolean);if(tacticList.length>0&&!tacticList.every(t=>TACTICS.some(T=>T.short===t)))return;setTools(p=>[...p,{...form,tactics:tacticList,ver:"custom",on:true,core:false}]);sForm({name:"",slot:"",desc:"",footprint:"low",tactics:""});};
   const toggle=(name)=>setTools(p=>p.map(t=>t.name===name?{...t,on:!t.on}:t));
   const slots=[...new Set(tools.map(t=>t.slot))];
   return<div>
@@ -387,10 +406,10 @@ function VCvss(){
   </Card>;
 }
 
-function VReport({op,findings,evidence}){
-  const[apiKey,sApiKey]=useState("");const[report,sReport]=useState("");const[busy,sBusy]=useState(false);
+function VReport({op,findings,evidence,apiKey,sApiKey}){
+  const[report,sReport]=useState("");const[busy,sBusy]=useState(false);
   const[practitioner,sPractitioner]=useState("");const[certs,sCerts]=useState("");const[attested,sAttested]=useState(false);
-  const gen=async()=>{if(!apiKey)return;sBusy(true);const text=await callClaude(apiKey,"You are a security assessment documentation specialist. Write a professional penetration test report following PTES methodology: 1. Executive Summary, 2. Scope and Rules of Engagement, 3. Methodology, 4. Findings by severity, 5. Recommendations, 6. Conclusion. Be factual and professional. No offensive techniques or exploit code.",`Operation: ${JSON.stringify(op.operation)}\nFindings: ${JSON.stringify(findings.map(f=>({title:f.title,severity:f.severity,host:f.host,cwe:f.cwe})))}\nEvidence records: ${evidence.length}`,3000);sReport(text);sBusy(false);};
+  const gen=async()=>{if(!apiKey)return;sBusy(true);try{const text=await callClaude(apiKey,"You are a security assessment documentation specialist. Write a professional penetration test report following PTES methodology: 1. Executive Summary, 2. Scope and Rules of Engagement, 3. Methodology, 4. Findings by severity, 5. Recommendations, 6. Conclusion. Be factual and professional. No offensive techniques or exploit code.",`Operation: ${sanitizeForPrompt(JSON.stringify(op.operation),500)}\nFindings: ${sanitizeForPrompt(JSON.stringify(findings.map(f=>({title:f.title,severity:f.severity,host:f.host,cwe:f.cwe}))),2000)}\nEvidence records: ${evidence.length}`,3000);sReport(text);}catch(e){sReport(`Error: ${e.message}`);}sBusy(false);};
   return<div>
     <Card><Sec t="GENERATE REPORT"/><div style={{display:"flex",gap:8,marginBottom:12}}><input value={apiKey} onChange={e=>sApiKey(e.target.value)} placeholder="API key" type="password" style={{flex:1}}/><Btn onClick={gen} dis={busy||!apiKey}>{busy?"GENERATING…":"GENERATE"}</Btn></div>{report?<pre style={{fontSize:11,fontFamily:F,lineHeight:1.6,whiteSpace:"pre-wrap",maxHeight:400,overflowY:"auto"}}>{report}</pre>:<Empty t="Generate report to see output"/>}</Card>
     <Card bc={attested?"var(--a)":"var(--b)"}><Sec t="PRACTITIONER ATTESTATION"/>
@@ -404,8 +423,8 @@ function VReport({op,findings,evidence}){
   </div>;
 }
 
-function VKB({knowledge,setKnowledge}){
-  const[apiKey,sApiKey]=useState("");const[busy,sBusy]=useState(false);const[text,sText]=useState("");
+function VKB({knowledge,setKnowledge,apiKey,sApiKey}){
+  const[busy,sBusy]=useState(false);const[text,sText]=useState("");
   const add=()=>{if(!text.trim())return;setKnowledge(p=>[...p,{id:uid(),ts:now(),content:text,quality:"unreviewed",source:"manual"}]);sText("");};
   const aiPop=async()=>{if(!apiKey)return;sBusy(true);const result=await callClaudeJSON(apiKey,"Security knowledge curator. Generate 3 useful knowledge entries about defensive analysis, remediation patterns, and security documentation best practices. Return JSON array: [{content}].","Generate security knowledge entries for an assessment team.");if(Array.isArray(result))setKnowledge(p=>[...p,...result.map(r=>({id:uid(),ts:now(),content:r.content,quality:"unreviewed",source:"ai"}))]);sBusy(false);};
   const setQ=(id,q)=>setKnowledge(p=>p.map(k=>k.id===id?{...k,quality:q}:k));
@@ -418,10 +437,10 @@ function VKB({knowledge,setKnowledge}){
   </div>;
 }
 
-function VInteg({findings,evidence,op,setFindings,addTL}){
-  const[apiKey,sApiKey]=useState("");const[busy,sBusy]=useState(false);
+function VInteg({findings,evidence,op,setFindings,addTL,apiKey,sApiKey}){
+  const[busy,sBusy]=useState(false);
   const exportJSON=()=>{const data={op,findings,evidence,exported_at:now(),version:"trident-v5"};const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`trident-export-${Date.now()}.json`;a.click();addTL("export","Exported engagement JSON");};
-  const importNessus=async()=>{if(!apiKey)return;sBusy(true);const result=await callClaudeJSON(apiKey,"Security tool integration specialist. Simulate a Nessus scan for the provided perimeter. Generate 3-5 realistic vulnerability findings. Return JSON array: [{title,severity,host,cwe,description,remediation}]. severity: critical|high|medium|low|info. Hosts must be from provided perimeter.",`Perimeter: ${JSON.stringify(op.perimeter)}`);if(Array.isArray(result)){const imported=result.map(f=>({...f,id:uid(),ts:now(),status:"open",source:"nessus-import"}));setFindings(p=>[...p,...imported]);addTL("import",`Imported ${imported.length} Nessus findings`);}sBusy(false);};
+  const importNessus=async()=>{if(!apiKey)return;sBusy(true);const result=await callClaudeJSON(apiKey,"Security tool integration specialist. Simulate a Nessus scan for the provided perimeter. Generate 3-5 realistic vulnerability findings. Return JSON array: [{title,severity,host,cwe,description,remediation}]. severity: critical|high|medium|low|info. Hosts must be from provided perimeter.",`Perimeter: ${sanitizeForPrompt(JSON.stringify(op.perimeter),1000)}`);if(Array.isArray(result)){const imported=result.map(f=>({...f,id:uid(),ts:now(),status:"open",source:"nessus-import"}));setFindings(p=>[...p,...imported]);addTL("import",`Imported ${imported.length} Nessus findings`);}sBusy(false);};
   return<div>
     <Card><Sec t="EXPORT"/><div style={{display:"flex",gap:8}}><Btn onClick={exportJSON}>EXPORT JSON</Btn><Btn ol dis>EXPORT SARIF</Btn><Btn ol dis>EXPORT JIRA</Btn></div></Card>
     <Card><Sec t="IMPORT (SIMULATED)"/><div style={{marginBottom:8,fontSize:10,color:"var(--d)",fontFamily:F}}>Simulated import via AI for testing. Real file parsing in v6.</div><div style={{display:"flex",gap:8,alignItems:"center"}}><input value={apiKey} onChange={e=>sApiKey(e.target.value)} placeholder="API key" type="password" style={{flex:1}}/><Btn onClick={importNessus} dis={busy||!apiKey}>{busy?"…":"SIMULATE NESSUS"}</Btn></div></Card>
@@ -456,17 +475,17 @@ function VSet({stealthVal,setStealthVal,mode,setMode}){
 // ─── APP ROOT ─────────────────────────────────────────────────────────
 export default function App(){
   const[view,sView]=useState("dashboard");
-  const[op,sOp]=useState(JSON.parse(JSON.stringify(EMPTY_OP)));
+  const[op,sOp]=useState(structuredClone(EMPTY_OP));
   const[approvals,sAppr]=useState([]);const[findings,sFind]=useState([]);const[violations,sViol]=useState([]);
   const[actions,sAct]=useState([]);const[evidence,sEvid]=useState([]);const[tools,sTools]=useState([...TOOL_SLOTS]);
   const[knowledge,sKB]=useState([]);const[timeline,sTL]=useState([]);
-  const[stealthVal,sStealthVal]=useState(35);const[mode,sMode]=useState("supervised");
+  const[stealthVal,sStealthVal]=useState(35);const[mode,sMode]=useState("supervised");const[apiKey,sApiKey]=useState("");
 
-  useEffect(()=>{(async()=>{try{const r=await window.storage.get("trident-v5");if(r){const d=JSON.parse(r.value);if(d.op)sOp(d.op);if(d.findings)sFind(d.findings);if(d.evidence)sEvid(d.evidence);if(d.actions)sAct(d.actions);if(d.approvals)sAppr(d.approvals);if(d.violations)sViol(d.violations);if(d.knowledge)sKB(d.knowledge);if(d.timeline)sTL(d.timeline);if(d.tools)sTools(d.tools);if(d.stealthVal!=null)sStealthVal(d.stealthVal);if(d.mode)sMode(d.mode);}}catch{}})();},[]);
-  useEffect(()=>{const t=setTimeout(()=>{(async()=>{try{await window.storage.set("trident-v5",JSON.stringify({op,findings,evidence,actions,approvals,violations,knowledge,timeline,tools,stealthVal,mode}));}catch{}})();},1000);return()=>clearTimeout(t);},[op,findings,evidence,actions,approvals,violations,knowledge,timeline,tools,stealthVal,mode]);
+  useEffect(()=>{(async()=>{try{const r=await storage.get("trident-v5");if(r){const d=JSON.parse(r.value);if(d.op)sOp(d.op);if(d.findings)sFind(d.findings);if(d.evidence)sEvid(d.evidence);if(d.actions)sAct(d.actions);if(d.approvals)sAppr(d.approvals);if(d.violations)sViol(d.violations);if(d.knowledge)sKB(d.knowledge);if(d.timeline)sTL(d.timeline);if(d.tools)sTools(d.tools);if(d.stealthVal!=null)sStealthVal(d.stealthVal);if(d.mode)sMode(d.mode);}}catch{}})();},[]);
+  useEffect(()=>{const t=setTimeout(()=>{(async()=>{try{await storage.set("trident-v5",JSON.stringify({op,findings,evidence,actions,approvals,violations,knowledge,timeline,tools,stealthVal,mode}));}catch{}})();},1000);return()=>clearTimeout(t);},[op,findings,evidence,actions,approvals,violations,knowledge,timeline,tools,stealthVal,mode]);
 
   const addTL=useCallback((type,text)=>{sTL(p=>[...p,{id:uid(),type,text,ts:now()}]);},[]);
-  const reset=()=>{if(!confirm("Reset all operation data?"))return;sOp(JSON.parse(JSON.stringify(EMPTY_OP)));sAppr([]);sFind([]);sViol([]);sAct([]);sEvid([]);sKB([]);sTL([]);sTools([...TOOL_SLOTS]);sStealthVal(35);sMode("supervised");window.storage.delete("trident-v5").catch(()=>{});};
+  const reset=()=>{if(!confirm("Reset all operation data?"))return;sOp(structuredClone(EMPTY_OP));sAppr([]);sFind([]);sViol([]);sAct([]);sEvid([]);sKB([]);sTL([]);sTools([...TOOL_SLOTS]);sStealthVal(35);sMode("supervised");sApiKey("");storage.delete("trident-v5").catch(()=>{});};
 
   const pc=approvals.filter(a=>a.status==="pending").length;
   const presetName=Object.entries(STEALTH_PRESETS).find(([,p])=>Math.abs(stealthVal-p.val)<10)?.[0]||`${stealthVal}%`;
@@ -484,15 +503,15 @@ export default function App(){
         {view==="dashboard"    &&<VDash op={op} approvals={approvals} findings={findings} violations={violations} actions={actions} evidence={evidence} timeline={timeline}/>}
         {view==="scope"        &&<VScope op={op} setOp={sOp}/>}
         {view==="map"          &&<VMap op={op} actions={actions} violations={violations}/>}
-        {view==="workbench"    &&<VWorkbench op={op} mode={mode} setActions={sAct} setViolations={sViol} setEvidence={sEvid} addTL={addTL} actions={actions} evidence={evidence}/>}
+        {view==="workbench"    &&<VWorkbench op={op} mode={mode} setActions={sAct} setViolations={sViol} setEvidence={sEvid} addTL={addTL} actions={actions} evidence={evidence} apiKey={apiKey} sApiKey={sApiKey} setApprovals={sAppr}/>}
         {view==="gate"         &&<VGate approvals={approvals} setApprovals={sAppr} addTL={addTL}/>}
-        {view==="findings"     &&<VFind findings={findings} setFindings={sFind} op={op} addTL={addTL}/>}
+        {view==="findings"     &&<VFind findings={findings} setFindings={sFind} op={op} addTL={addTL} apiKey={apiKey} sApiKey={sApiKey}/>}
         {view==="evidence"     &&<VEvid evidence={evidence}/>}
         {view==="tools"        &&<VTools tools={tools} setTools={sTools}/>}
         {view==="cvss"         &&<VCvss/>}
-        {view==="report"       &&<VReport op={op} findings={findings} evidence={evidence}/>}
-        {view==="knowledge"    &&<VKB knowledge={knowledge} setKnowledge={sKB}/>}
-        {view==="integrations" &&<VInteg findings={findings} evidence={evidence} op={op} setFindings={sFind} addTL={addTL}/>}
+        {view==="report"       &&<VReport op={op} findings={findings} evidence={evidence} apiKey={apiKey} sApiKey={sApiKey}/>}
+        {view==="knowledge"    &&<VKB knowledge={knowledge} setKnowledge={sKB} apiKey={apiKey} sApiKey={sApiKey}/>}
+        {view==="integrations" &&<VInteg findings={findings} evidence={evidence} op={op} setFindings={sFind} addTL={addTL} apiKey={apiKey} sApiKey={sApiKey}/>}
         {view==="timeline"     &&<VTL timeline={timeline}/>}
         {view==="settings"     &&<VSet stealthVal={stealthVal} setStealthVal={sStealthVal} mode={mode} setMode={sMode}/>}
       </div>
