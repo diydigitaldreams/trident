@@ -88,7 +88,7 @@ const storage = {
 
 // ── PerimeterGuard inline ────────────────────────────────────────────
 function escapeRx(s) { return s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
-function normTarget(t) { return t.replace(/^https?:\/\//,"").split("/")[0].split(":")[0]; }
+function normTarget(t) { return String(t||"").trim().replace(/^https?:\/\//i,"").split("/")[0].split(":")[0].toLowerCase(); }
 // NOTE: IPv4 only. IPv6 CIDR support is out of scope for single-file artifact.
 function matchCIDR(host,cidr) {
   const p=cidr.split("/"); if(p.length!==2) return host===cidr;
@@ -100,8 +100,18 @@ function matchCIDR(host,cidr) {
   const mi=mask===0?0:((~0<<(32-mask))>>>0);
   return (ci&mi)===(hi&mi);
 }
-function matchHost(h,p) { if(!p.includes("*")) return h===p; return new RegExp("^"+p.split("*").map(escapeRx).join("[^.]*")+"$").test(h); }
-function matchDomain(h,d) { if(d.startsWith("*.")) return h.endsWith("."+d.slice(2))||h===d.slice(2); return h===d; }
+function matchHost(h,p) {
+  const host=String(h||"").toLowerCase();
+  const pattern=String(p||"").trim().toLowerCase();
+  if(!pattern.includes("*")) return host===pattern;
+  return new RegExp("^"+pattern.split("*").map(escapeRx).join("[^.]*")+"$").test(host);
+}
+function matchDomain(h,d) {
+  const host=String(h||"").toLowerCase();
+  const domain=String(d||"").trim().toLowerCase();
+  if(domain.startsWith("*.")) return host.endsWith("."+domain.slice(2))||host===domain.slice(2);
+  return host===domain;
+}
 
 class PerimeterGuard {
   constructor(op) { this.op=op; }
